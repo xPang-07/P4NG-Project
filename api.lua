@@ -1,280 +1,146 @@
--- ═══════════════════════════════════════════════════════════════
---  P4NG Launcher · api.lua v2.0
---  รวม: ต้นฉบับ (ตรวจจับหลุดสมบูรณ์) + ของผม (port discovery, userId, desc)
--- ═══════════════════════════════════════════════════════════════
+--[[
+  P4NG api.lua — ตัวรายงานสถานะของ P4NG Launcher (รันในเกมผ่าน executor)
 
--- ── ป้องกัน double-inject ─────────────────────────────────────
-if _G.P4NG and _G.P4NG._initialized then return _G.P4NG end
+  ทำอะไร
+    • POST /               heartbeat ทุก 15 วิ (บอก launcher ว่าเข้าเกมแล้ว / ยังอยู่)
+    • POST /api/disconnect  เมื่อโดนเตะ/หลุด/ขึ้นหน้า error
+    • POST /api/desc        ข้อความสถานะสั้น ๆ (ถ้าตั้ง getgenv().P4NG_DESC)
+    • GET  /api/script      ดึง Auto-Exec script จาก launcher มารัน (ถ้าเปิดไว้)
+
+  ต้องการ executor ที่มี: request / http_request / syn.request  และ loadstring
+  คุยกับ 127.0.0.1 เท่านั้น (พอร์ต 3030–3032 ตาม core/heartbeat.py) — ไม่ส่งข้อมูลออกเน็ต
+  วางไฟล์นี้ในโฟลเดอร์ autoexec ของ executor ตัวเดียวใช้ได้ทุกบัญชี
+]]
+
+if getgenv and getgenv().__P4NG_API then return end
+if getgenv then getgenv().__P4NG_API = true end
+
+local PORTS         = { 3030, 3031, 3032 }
+local BEAT_INTERVAL = 15      -- วิ (launcher ถือว่าเงียบถ้าเกิน ~30 วิ)
+local HTTP_TIMEOUT  = 5
+
+if not game:IsLoaded() then game.Loaded:Wait() end
 
 local Players    = game:GetService("Players")
-local HttpService = game:GetService("HttpService")
 local GuiService = game:GetService("GuiService")
-local CoreGui    = game:GetService("CoreGui")
+local HttpService = game:GetService("HttpService")
 
--- รอ LocalPlayer
-repeat task.wait() until game:IsLoaded()
-local lp = Players.LocalPlayer
-repeat task.wait() until lp
-
-local P4NG = {
-    _initialized = true,
-    VERSION      = "2.0",
-    PORTS        = { 3030, 3031, 3032 },
-    INTERVAL     = 10,
-    MAX_RETRIES  = 3,
-    RETRY_DELAY  = 0.5,
-    DEBUG        = false,
-
-    -- ★ จากต้นฉบับ: error code ที่ไม่ใช่การหลุดจริง
-    IGNORED_ERRORS = {
-        [285] = true,   -- DisconnectClientInitiated
-        [768] = true, [769] = true, [770] = true,
-        [771] = true, [772] = true, [773] = true,
-        [774] = true, [775] = true,
-    },
-    IGNORED_MESSAGES = {
-        DisconnectClientInitiated = true,
-    },
-
-    -- ── state ──
-    Running       = true,
-    KickMessage   = "",
-    PromptReason  = nil,
-    DisconnectCode = nil,
-    Notified      = false,
-    ActivePort    = nil,
-}
-_G.P4NG = P4NG
-
--- ── logger ────────────────────────────────────────────────────
-local function log(fmt, ...)
-    if P4NG.DEBUG then
-        print(("[P4NG] " .. fmt):format(...))
-    end
-end
-
--- ── HTTP function ─────────────────────────────────────────────
-local httpFn = request or http_request
-    or (syn and syn.request)
-    or (http and http.request)
+local http = (syn and syn.request) or (http and http.request) or http_request or request
     or (fluxus and fluxus.request)
-    or (krnl and krnl.request)
-
-if not httpFn then
-    return warn("[P4NG] executor ไม่รองรับ HTTP")
+if not http then
+    warn("[P4NG] executor นี้ไม่มี request/http_request — api.lua ทำงานไม่ได้")
+    return
 end
 
--- ── Port discovery (ของผม — กันพอร์ตชน) ─────────────────────
-local function ping(port)
-    local ok, res = pcall(httpFn, {
-        Url    = ("http://127.0.0.1:%d/"):format(port),
-        Method = "GET",
+local player = Players.LocalPlayer
+while not player do task.wait(0.2); player = Players.LocalPlayer end
+
+local base -- http://127.0.0.1:PORT
+
+local function call(method, path, body)
+    local ok, res = pcall(http, {
+        Url = base .. path,
+        Method = method,
+        Headers = { ["Content-Type"] = "application/json" },
+        Body = body and HttpService:JSONEncode(body) or nil,
+        Timeout = HTTP_TIMEOUT,
     })
-    if not ok or not res then return false end
-    local code = res.StatusCode or res.Status or res.status
-    return tonumber(code) == 200
+    if not ok or type(res) ~= "table" then return nil end
+    local code = res.StatusCode or res.status_code
+    if code and code ~= 200 then return nil end
+    local okj, data = pcall(HttpService.JSONDecode, HttpService, res.Body or "")
+    return okj and data or nil
 end
 
-local function getPort()
-    if P4NG.ActivePort and ping(P4NG.ActivePort) then
-        return P4NG.ActivePort
+local function findPort()
+    for _, p in ipairs(PORTS) do
+        base = "http://127.0.0.1:" .. p
+        local r = call("GET", "/")
+        if r and r.service == "P4NG" then return true end
     end
-    for _, p in ipairs(P4NG.PORTS) do
-        if ping(p) then
-            P4NG.ActivePort = p
-            return p
-        end
-    end
-    P4NG.ActivePort = nil
-    return nil
-end
-
--- ── ส่ง + retry (ของต้นฉบับ) ────────────────────────────────
-local function post(path, body)
-    local payload = HttpService:JSONEncode(body)
-    for attempt = 1, P4NG.MAX_RETRIES do
-        local port = getPort()
-        if port then
-            local ok, res = pcall(httpFn, {
-                Url     = ("http://127.0.0.1:%d%s"):format(port, path),
-                Method  = "POST",
-                Headers = { ["Content-Type"] = "application/json" },
-                Body    = payload,
-            })
-            if ok and res then
-                local code = res.StatusCode or res.Status or res.status
-                if tonumber(code) == 200 then return true end
-            end
-        end
-        if attempt < P4NG.MAX_RETRIES then
-            task.wait(P4NG.RETRY_DELAY)
-        end
-    end
+    base = nil
     return false
 end
 
--- ── heartbeat ─────────────────────────────────────────────────
-local function beat()
-    return post("/", {
-        username = lp.Name,
-        userId   = lp.UserId,        -- ★ ของผม
+local function identity()
+    return {
+        username = player.Name,
+        userId   = player.UserId,
         placeId  = game.PlaceId,
         jobId    = game.JobId,
         gameId   = game.GameId,
-    })
-end
-P4NG.beat = beat
-
--- ── Public API ────────────────────────────────────────────────
-function P4NG.desc(text)
-    post("/api/desc", {
-        username = lp.Name,
-        userId   = lp.UserId,
-        desc     = tostring(text or ""):sub(1, 160),
-    })
+    }
 end
 
-function P4NG.drop(reason, code)
-    post("/api/disconnect", {
-        username   = lp.Name,
-        userId     = lp.UserId,
-        reason     = tostring(reason or "unknown"):sub(1, 160),
-        error_code = code,
-    })
+local function post(path, extra)
+    if not base and not findPort() then return end
+    local body = identity()
+    for k, v in pairs(extra or {}) do body[k] = v end
+    local r = call("POST", path, body)
+    if not r then            -- launcher อาจเปลี่ยนพอร์ต/เพิ่งเปิดใหม่ → หาใหม่รอบหน้า
+        base = nil
+    end
+    return r
 end
 
--- ── helpers (ของต้นฉบับ) ──────────────────────────────────────
-local function isIgnored(code, msg)
-    if code and P4NG.IGNORED_ERRORS[code] then return true end
-    if msg and P4NG.IGNORED_MESSAGES[msg] then return true end
-    return false
+-- ── disconnect / kick ───────────────────────────────────────────
+local dropped = false
+local function reportDrop(reason, code)
+    if dropped then return end
+    dropped = true
+    post("/api/disconnect", { reason = tostring(reason or "Unknown"), error_code = code })
 end
 
-local function extractPromptText(prompt)
-    local texts = {}
-    for _, d in ipairs(prompt:GetDescendants()) do
-        if d:IsA("TextLabel") and d.Visible then
-            local t = d.Text
-            if t and t ~= "" and t ~= "OK" and t ~= "Leave" and t ~= "Rejoin" then
-                table.insert(texts, t)
-            end
-        end
-    end
-    -- dedupe
-    local seen, out = {}, {}
-    for _, t in ipairs(texts) do
-        local s = t:gsub("^%s+", ""):gsub("%s+$", "")
-        if s ~= "" and not seen[s] then
-            seen[s] = true
-            table.insert(out, s)
-        end
-    end
-    return table.concat(out, " - ")
-end
-
-local function buildReason()
-    if P4NG.PromptReason and P4NG.PromptReason ~= "" then
-        return P4NG.PromptReason
-    end
-    if P4NG.KickMessage and P4NG.KickMessage ~= "" then
-        return P4NG.KickMessage
-    end
-    return "Unknown"
-end
-
-local function notifyDisconnect()
-    if P4NG.Notified then return end
-    P4NG.Notified = true
-    post("/api/disconnect", {
-        username   = lp.Name,
-        userId     = lp.UserId,
-        reason     = buildReason(),
-        error_code = P4NG.DisconnectCode,
-    })
-    task.wait(0.4)
-end
-
--- ── ตรวจจับการหลุด ───────────────────────────────────────────
-
--- 1. Error code จาก GuiService
-local function checkErrorCode()
-    local code = GuiService:GetErrorCode().Value
-    if code >= Enum.ConnectionError.DisconnectErrors.Value
-       and not P4NG.IGNORED_ERRORS[code] then
-        P4NG.DisconnectCode = code
-        P4NG.Running = false
-        return true
-    end
-    return false
-end
-
--- 2. ErrorMessageChanged (kick message จาก server)
-GuiService.ErrorMessageChanged:Connect(function(msg)
-    if msg and msg ~= "" then
-        local code = GuiService:GetErrorCode().Value
-        if isIgnored(code, msg) then return end
-        P4NG.KickMessage = msg
-        P4NG.DisconnectCode = code
-        P4NG.Running = false
-        notifyDisconnect()
-    end
-end)
-
--- 3. ErrorPrompt UI ใน CoreGui
-CoreGui.DescendantAdded:Connect(function(inst)
-    if not inst.Name:find("ErrorPrompt") then return end
-    task.wait(0.25)
-    local code = GuiService:GetErrorCode().Value
-    if isIgnored(code, nil) then return end
-    local ok, text = pcall(extractPromptText, inst)
-    if not ok or text == "" or text == nil then return end
-    P4NG.PromptReason = text
-    P4NG.DisconnectCode = code
-    P4NG.Running = false
-    notifyDisconnect()
-end)
-
--- 4. PlayerRemoving / AncestryChanged (ของผม — จับ graceful leave)
-Players.PlayerRemoving:Connect(function(p)
-    if p == lp then
-        P4NG.Running = false
-        P4NG.drop("PlayerRemoving")
-    end
-end)
-
-lp.AncestryChanged:Connect(function(_, parent)
-    if not parent then
-        P4NG.Running = false
-        P4NG.drop("AncestryChanged")
-    end
-end)
-
--- ── Auto-optimize (ของต้นฉบับ) ────────────────────────────────
 pcall(function()
-    local UserGameSettings = UserSettings():GetService("UserGameSettings")
-    UserGameSettings.Rendering.QualityLevel = Enum.QualityLevel.Level01
-    UserGameSettings.GraphicsQualityLevel = 1
-    UserGameSettings.MasterVolume = 0
-    log("optimize graphics: done")
+    GuiService.ErrorMessageChanged:Connect(function()
+        local msg = GuiService:GetErrorMessage()
+        if msg and msg ~= "" then
+            local okc, code = pcall(function() return GuiService:GetErrorType().Value end)
+            reportDrop(msg, okc and code or nil)
+        end
+    end)
 end)
 
--- ── Main loop ────────────────────────────────────────────────
+-- ── auto-exec (ดึง script จาก launcher ครั้งเดียวต่อการเข้าเกม) ──
 task.spawn(function()
-    task.wait(0.5)
-    beat()
-
-    while P4NG.Running do
-        task.wait(P4NG.INTERVAL)
-        if checkErrorCode() then break end
-        beat()
+    if not findPort() then
+        for _ = 1, 20 do          -- launcher อาจยังไม่พร้อม — ลองต่อ ~1 นาที
+            task.wait(3)
+            if findPort() then break end
+        end
     end
+    if not base then return end
 
-    if P4NG.DisconnectCode then
-        notifyDisconnect()
+    local r = call("GET", "/api/script?uid=" .. tostring(player.UserId))
+    local src = r and r.script
+    if type(src) ~= "string" or src:match("^%s*$") then return end
+
+    task.wait(tonumber(r.delay) or 2)
+    local fn, err = loadstring(src)
+    if not fn then
+        warn("[P4NG] script คอมไพล์ไม่ผ่าน: " .. tostring(err))
+        return
+    end
+    local ok, e = pcall(fn)
+    if not ok then warn("[P4NG] script error: " .. tostring(e)) end
+end)
+
+-- ── desc (ตั้งใน script ของคุณ: getgenv().P4NG_DESC = "ข้อความ") ──
+local lastDesc
+task.spawn(function()
+    while task.wait(5) do
+        local d = getgenv and getgenv().P4NG_DESC
+        if type(d) == "string" and d ~= lastDesc then
+            lastDesc = d
+            post("/api/desc", { desc = d })
+        end
     end
 end)
 
-log("พร้อมทำงาน v%s · port=%s · interval=%ds",
-    P4NG.VERSION, tostring(P4NG.ActivePort or "?"), P4NG.INTERVAL)
-
-return P4NG
+-- ── heartbeat ──────────────────────────────────────────────────
+task.spawn(function()
+    while not dropped do
+        post("/")
+        task.wait(BEAT_INTERVAL)
+    end
+end)
