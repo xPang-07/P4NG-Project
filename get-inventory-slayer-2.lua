@@ -1,17 +1,17 @@
 -- ═══════════════════════════════════════════════════════════════
---   SLAYER 2 — FULL DATA → WEB (v6)
---   • กระเป๋า + Level + Title + Mastery + Stats
---   • กด M ครั้งเดียว → อัปเดตอัตโนมัติ
+--   SLAYER 2 — FULL DATA → WEB (v7 · performance)
+--   • GC scanned ONCE (cached table refs — no 5s rescans)
+--   • UI labels cached (no 5s PlayerGui walks)
+--   • Payload hash dedupe (no redundant HTTP)
 -- ═══════════════════════════════════════════════════════════════
 task.spawn(function()
-    -- ─────────────────────────────────────────
-    -- ตั้งค่า
-    -- ─────────────────────────────────────────
+    ------------------------------------------------------------------
+    -- Config
+    ------------------------------------------------------------------
     local WEB           = "http://localhost:3000"
-    local URL_INV       = WEB .. "/api/inventory"
-    local URL_CHAR      = WEB .. "/api/character"
     local SEND_INTERVAL = 5
-    local UI_POLL       = 1.5
+    local UI_POLL       = 2
+    local GC_RESCAN     = 90      -- seconds, only if data goes stale
     local DEBUG         = false
 
     local HttpService = game:GetService("HttpService")
@@ -28,196 +28,201 @@ task.spawn(function()
              or (_G.http and _G.http.request)
     if not req then return warn("❌ ไม่รองรับ HTTP") end
 
-    -- ─────────────────────────────────────────
-    -- Helpers
-    -- ─────────────────────────────────────────
-    local function safeGet(t, k)
-        local ok, v = pcall(rawget, t, k); if ok then return v end
-    end
-    local function isTable(v) return type(v) == "table" end
-    local function count(t) local c=0; for _ in pairs(t) do c+=1 end; return c end
     local function log(fmt, ...) if DEBUG then print(("[P4NG] "..fmt):format(...)) end end
+    local function isTable(v) return type(v) == "table" end
+    local function count(t) local c = 0; for _ in pairs(t) do c += 1 end; return c end
 
-    -- ─────────────────────────────────────────
-    -- CHARACTER INFO — ดึงจากหลายแหล่ง
-    -- ─────────────────────────────────────────
+    ------------------------------------------------------------------
+    -- Key matching
+    ------------------------------------------------------------------
     local INFO_KEYS = {
-        -- patterns ที่ต้องการ (lowercase)
-        "level", "lvl",
-        "title", "titleid",
-        "mastery", "masteries",
-        "exp", "experience", "xp",
-        "coins", "money", "gold", "cash", "yen", "currency",
-        "kills", "deaths", "wins", "losses",
-        "rank", "tier", "grade",
-        "clan", "clanname", "family",
-        "breathing", "breath", "style", "fightingstyle",
-        "strength", "defense", "agility", "speed",
-        "health", "maxhealth", "stamina",
-        "race", "bloodline",
-        "playtime", "hours",
+        "level","lvl","title","titleid","mastery","masteries",
+        "exp","experience","xp","coins","money","gold","cash","yen","currency",
+        "kills","deaths","wins","losses","rank","tier","grade",
+        "clan","clanname","family","breathing","breath","style","fightingstyle",
+        "strength","defense","agility","speed","health","maxhealth","stamina",
+        "race","bloodline","playtime","hours",
     }
-
-    local function normalizeKey(k)
-        return string.lower(tostring(k)):gsub("[%s_%-%.]", "")
+    local NORM_KEYS = {}
+    for i, p in ipairs(INFO_KEYS) do
+        NORM_KEYS[i] = p:gsub("[%s_%-%.]", "")
     end
+
+    local function normalize(k) return string.lower(tostring(k)):gsub("[%s_%-%.]", "") end
 
     local function matchKey(k)
-        local nk = normalizeKey(k)
-        for _, pat in ipairs(INFO_KEYS) do
-            local np = normalizeKey(pat)
-            if string.find(nk, np, 1, true) then return true end
+        local nk = normalize(k)
+        for i = 1, #NORM_KEYS do
+            if string.find(nk, NORM_KEYS[i], 1, true) then return true end
         end
         return false
     end
 
-    local function scanAttrs(inst, label)
-        local out = {}
-        if not inst then return out end
+    ------------------------------------------------------------------
+    -- Attribute / children readers
+    ------------------------------------------------------------------
+    local function scanAttrs(inst, out)
+        if not inst then return end
         local ok, attrs = pcall(function() return inst:GetAttributes() end)
-        if not ok or not attrs then return out end
+        if not ok or not attrs then return end
         for k, v in pairs(attrs) do
-            if matchKey(k) then
+            if out[k] == nil and matchKey(k) then
                 local t = typeof(v)
-                if t == "number" or t == "string" or t == "boolean" then
-                    out[k] = v
-                end
+                if t == "number" or t == "string" or t == "boolean" then out[k] = v end
             end
         end
-        return out
     end
 
-    local function scanChildren(inst, label)
-        -- เช่น leaderstats (Folder → IntValue)
-        local out = {}
-        if not inst then return out end
+    local function scanChildren(inst, out)
+        if not inst then return end
         local ok, children = pcall(function() return inst:GetChildren() end)
-        if not ok then return out end
+        if not ok then return end
         for _, c in ipairs(children) do
-            local t = c.ClassName
-            if t == "IntValue" or t == "NumberValue" or t == "StringValue" or t == "BoolValue" then
-                if matchKey(c.Name) then
-                    out[c.Name] = c.Value
-                end
-            elseif t == "Folder" then
-                local sub = scanChildren(c, label)
-                for k, v in pairs(sub) do out[k] = v end
+            local cn = c.ClassName
+            if cn == "IntValue" or cn == "NumberValue"
+               or cn == "StringValue" or cn == "BoolValue" then
+                if out[c.Name] == nil and matchKey(c.Name) then out[c.Name] = c.Value end
+            elseif cn == "Folder" then
+                scanChildren(c, out)
             end
         end
-        return out
     end
 
-    local function findPlayerDataTable()
-        -- สแกน GC หา table ที่ดูเหมือน player data
-        local candidates = {}
-        local checked = 0
+    ------------------------------------------------------------------
+    -- ONE-TIME GC SCAN — cache table references
+    ------------------------------------------------------------------
+    local dataTables = {}
+    local lastGCScan = 0
+
+    local function scanForDataTables()
+        local found = {}
+        local scanned = 0
         for _, v in pairs(getgc(true)) do
-            checked += 1
-            if checked > 500000 then break end
+            scanned += 1
+            if scanned > 150000 then break end
             if type(v) == "table" then
-                local hits = 0
-                local sample = {}
-                local n = 0
+                local hits, n = 0, 0
                 for k, val in pairs(v) do
                     n += 1
-                    if n > 200 then break end
+                    if n > 40 then break end
                     if type(k) == "string" and matchKey(k) then
-                        local t = type(val)
-                        if t == "number" or t == "string" or t == "boolean" then
+                        local tv = type(val)
+                        if tv == "number" or tv == "string" or tv == "boolean" then
                             hits += 1
-                            if #sample < 30 then
-                                sample[k] = val
-                            end
+                            if hits >= 3 then break end
                         end
                     end
                 end
-                if hits >= 3 then
-                    candidates[#candidates+1] = {tbl = v, hits = hits, sample = sample, size = n}
-                end
-            end
-        end
-        table.sort(candidates, function(a,b) return a.hits > b.hits end)
-        return candidates
-    end
-
-    local function scanUIForInfo()
-        -- อ่าน HUD เพื่อหา Level/Title (มักแสดงเป็น TextLabel บนจอ)
-        local found = {}
-        local pg = lp:FindFirstChild("PlayerGui"); if not pg then return found end
-
-        local ok, descendants = pcall(function() return pg:GetDescendants() end)
-        if not ok then return found end
-
-        for _, d in ipairs(descendants) do
-            if d:IsA("TextLabel") and d.Visible then
-                local n = d.Name:lower()
-                -- Level display
-                if n:find("level") or n:find("lvl") then
-                    local num = tonumber(d.Text) or tonumber((d.Text or ""):match("(%d+)"))
-                    if num then found.Level = num end
-                end
-                -- Title display
-                if (n:find("title") or n:find("rank")) and d.Text and #d.Text < 60 then
-                    found.Title = d.Text
-                end
-                -- Clan
-                if n:find("clan") and d.Text and #d.Text < 40 then
-                    found.Clan = d.Text
-                end
+                if hits >= 3 then found[#found + 1] = v end
             end
         end
         return found
     end
 
-    -- ─────────────────────────────────────────
-    -- เก็บข้อมูลตัวละคร
-    -- ─────────────────────────────────────────
+    local function collectFrom(tbl, out, depth)
+        if not isTable(tbl) then return end
+        local n = 0
+        for k, v in pairs(tbl) do
+            n += 1
+            if n > 150 then break end
+            if type(k) == "string" then
+                if out[k] == nil and matchKey(k) then
+                    local tv = type(v)
+                    if tv == "number" or tv == "string" or tv == "boolean" then
+                        out[k] = v
+                    end
+                end
+                if depth > 0 and isTable(v) then
+                    collectFrom(v, out, depth - 1)
+                end
+            end
+        end
+    end
+
+    ------------------------------------------------------------------
+    -- UI label cache
+    ------------------------------------------------------------------
+    local uiLabels = {}
+    local lastUIScan = 0
+
+    local function cacheUILabels()
+        local t = {}
+        local pg = lp:FindFirstChild("PlayerGui")
+        if pg then
+            local ok, desc = pcall(function() return pg:GetDescendants() end)
+            if ok then
+                for _, d in ipairs(desc) do
+                    if d:IsA("TextLabel") and d.Visible then
+                        local n = d.Name:lower()
+                        local kind
+                        if n:find("level") or n:find("lvl") then kind = "Level"
+                        elseif n:find("title") or n:find("rank") then kind = "Title"
+                        elseif n:find("clan") then kind = "Clan"
+                        end
+                        if kind then t[#t + 1] = { obj = d, kind = kind } end
+                    end
+                end
+            end
+        end
+        uiLabels = t
+        lastUIScan = os.clock()
+    end
+
+    local function readUILabels()
+        if os.clock() - lastUIScan > 30 then cacheUILabels() end
+        local out = {}
+        for _, e in ipairs(uiLabels) do
+            local obj = e.obj
+            if obj and obj.Parent then
+                local txt = obj.Text
+                if e.kind == "Level" then
+                    local n = tonumber(txt) or tonumber(tostring(txt):match("(%d+)"))
+                    if n then out.Level = n end
+                elseif #txt < 60 then
+                    out[e.kind] = txt
+                end
+            end
+        end
+        return out
+    end
+
+    ------------------------------------------------------------------
+    -- Character info refresh (CHEAP — reads cached refs only)
+    ------------------------------------------------------------------
     local cachedInfo = {}
 
     local function refreshCharacterInfo()
         local info = {}
 
-        -- 1. Player attributes
-        for k, v in pairs(scanAttrs(lp, "Player")) do info[k] = v end
+        scanAttrs(lp, info)
+        if lp.Character then scanAttrs(lp.Character, info) end
 
-        -- 2. Character attributes
-        if lp.Character then
-            for k, v in pairs(scanAttrs(lp.Character, "Char")) do info[k] = v end
-        end
-
-        -- 3. leaderstats
         local ls = lp:FindFirstChild("leaderstats")
-        if ls then
-            for k, v in pairs(scanChildren(ls, "leaderstats")) do info[k] = v end
+        if ls then scanChildren(ls, info) end
+
+        -- read from cached GC table references (no re-scan!)
+        if #dataTables == 0 or os.clock() - lastGCScan > GC_RESCAN then
+            dataTables = scanForDataTables()
+            lastGCScan = os.clock()
+            log("GC scan → %d candidate tables", #dataTables)
+        end
+        for i = 1, #dataTables do
+            collectFrom(dataTables[i], info, 1)
         end
 
-        -- 4. PlayerData จาก GC (best match)
-        local candidates = findPlayerDataTable()
-        if #candidates > 0 then
-            -- เอา top 3 มารวมกัน
-            for i = 1, math.min(3, #candidates) do
-                for k, v in pairs(candidates[i].sample) do
-                    if info[k] == nil then info[k] = v end
-                end
-            end
-            info._datatablesFound = #candidates
-        end
-
-        -- 5. UI scan (ค่าอาจไม่ครบ — เอามา merge)
-        local ui = scanUIForInfo()
-        for k, v in pairs(ui) do
+        for k, v in pairs(readUILabels()) do
             if info[k] == nil then info[k] = v end
         end
 
         cachedInfo = info
     end
 
-    -- ─────────────────────────────────────────
-    -- INVENTORY — กด M + ซ่อน UI (จาก v5)
-    -- ─────────────────────────────────────────
+    ------------------------------------------------------------------
+    -- INVENTORY — press M once, cache children
+    ------------------------------------------------------------------
     local function pressM()
         pcall(function()
-            VIM:SendKeyEvent(true, Enum.KeyCode.M, false, game)
+            VIM:SendKeyEvent(true,  Enum.KeyCode.M, false, game)
             task.wait(0.05)
             VIM:SendKeyEvent(false, Enum.KeyCode.M, false, game)
         end)
@@ -237,7 +242,7 @@ task.spawn(function()
     end
 
     local function hideUI(holder)
-        local bg = holder:FindFirstChild("Background")
+        local bg = holder and holder:FindFirstChild("Background")
         if bg and bg:IsA("GuiObject") then bg.Visible = false end
     end
 
@@ -250,9 +255,8 @@ task.spawn(function()
                         c += 1
                         if c > 500 then break end
                         if type(k) == "string" and isTable(item) then
-                            if safeGet(item,"Rarity")
-                               and safeGet(item,"Icon")
-                               and safeGet(item,"Category") then
+                            if rawget(item, "Rarity") and rawget(item, "Icon")
+                               and rawget(item, "Category") then
                                 m += 1
                                 if m >= 50 then return true end
                             end
@@ -271,16 +275,17 @@ task.spawn(function()
         if not frame:IsA("Frame") then return nil end
         local name = frame.Name
         if not name or name == "" then return nil end
+
         local amount = 1
         local amtObj = frame:FindFirstChild("Amount")
         if amtObj then
             local txt
             if amtObj:IsA("TextLabel") then txt = amtObj.Text
-            elseif amtObj:IsA("IntValue") or amtObj:IsA("NumberValue") then txt = tostring(amtObj.Value)
+            elseif amtObj:IsA("IntValue") or amtObj:IsA("NumberValue") then
+                txt = tostring(amtObj.Value)
             end
             if txt then
-                local n = tonumber(txt) or tonumber(tostring(txt):match("%d+"))
-                if n then amount = n end
+                amount = tonumber(txt) or tonumber(tostring(txt):match("%d+")) or 1
             end
         end
         if amount == 1 then
@@ -296,8 +301,8 @@ task.spawn(function()
 
     local cache = {}
 
-    local function refreshCache()
-        local ah = findHolder(); if not ah then return end
+    local function refreshCache(ah)
+        if not ah then return end
         local new = {}
         for _, frame in ipairs(ah:GetChildren()) do
             local name, amount = readFrame(frame)
@@ -306,135 +311,124 @@ task.spawn(function()
                 new[name] = {
                     Name     = name,
                     Amount   = amount,
-                    ItemId   = safeGet(info, "Id"),
-                    Rarity   = safeGet(info, "Rarity"),
-                    Icon     = safeGet(info, "Icon"),
-                    Category = safeGet(info, "Category"),
+                    ItemId   = info.Id,
+                    Rarity   = info.Rarity,
+                    Icon     = info.Icon,
+                    Category = info.Category,
                 }
             end
         end
         cache = new
     end
 
-    -- ─────────────────────────────────────────
+    ------------------------------------------------------------------
     -- Setup DB
-    -- ─────────────────────────────────────────
+    ------------------------------------------------------------------
     local DB = findDB()
     if not DB then return warn("❌ ไม่เจอ Item DB") end
     for id, item in pairs(DB) do
-        if type(id) == "string" and isTable(item) then
-            dbByName[id] = item
-        end
+        if type(id) == "string" and isTable(item) then dbByName[id] = item end
     end
     print(("✅ เจอ DB: %d items"):format(count(dbByName)))
 
-    -- ─────────────────────────────────────────
-    -- กด M ครั้งแรก
-    -- ─────────────────────────────────────────
     print("🎯 กด M เปิดกระเป๋าครั้งแรก...")
     pressM()
     task.wait(0.8)
 
     local ah, holder = findHolder()
     if ah then
-        refreshCache()
+        refreshCache(ah)
         print(("✅ อ่านกระเป๋าครั้งแรก %d items"):format(count(cache)))
-        if holder then hideUI(holder) end
-        ah.ChildAdded:Connect(function() task.wait(0.15); refreshCache() end)
-        ah.ChildRemoved:Connect(function() task.wait(0.15); refreshCache() end)
+        hideUI(holder)
+        ah.ChildAdded:Connect(function()   task.wait(0.15); refreshCache(ah) end)
+        ah.ChildRemoved:Connect(function() task.wait(0.15); refreshCache(ah) end)
     end
 
-    -- ─────────────────────────────────────────
-    -- Getter
-    -- ─────────────────────────────────────────
     local function getMyInventory()
         local r = {}
-        for _, item in pairs(cache) do r[#r+1] = item end
+        for _, item in pairs(cache) do r[#r + 1] = item end
         return r
     end
     getgenv().getMyInventory = getMyInventory
-    getgenv().getMyInfo = function() return cachedInfo end
+    getgenv().getMyInfo      = function() return cachedInfo end
 
-    -- ─────────────────────────────────────────
-    -- ส่ง Inventory
-    -- ─────────────────────────────────────────
+    ------------------------------------------------------------------
+    -- SEND — hash dedupe (skip HTTP if nothing changed)
+    ------------------------------------------------------------------
+    local lastInvCore, lastCharCore
+
+    local function postJSON(url, payloadStr)
+        local ok, res = pcall(req, {
+            Url = url, Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = payloadStr,
+        })
+        if not ok or not res then return false end
+        local code = res.StatusCode or res.Status or res.status
+        return tostring(code) == "200"
+    end
+
     local function sendInv()
         local list = getMyInventory()
         if #list == 0 then return end
+
         local out = {}
         for _, it in ipairs(list) do
             local icon = it.Icon
             if type(icon) == "string" then icon = icon:match("(%d+)") or icon end
-            out[#out+1] = {
+            out[#out + 1] = {
                 Name = it.Name, Amount = it.Amount, Rarity = it.Rarity,
                 Category = it.Category, Icon = icon, ItemId = it.ItemId,
             }
         end
-        local payload = HttpService:JSONEncode({
-            game = tostring(game.PlaceId),
-            player = lp.Name, userId = lp.UserId,
-            timestamp = os.time(), items = out,
-        })
-        local ok, res = pcall(req, {
-            Url = URL_INV, Method = "POST",
-            Headers = { ["Content-Type"] = "application/json" },
-            Body = payload,
-        })
-        if ok and res then
-            local code = res.StatusCode or res.Status or res.status or "?"
-            if tostring(code) == "200" then
-                print(("[SEND-INV] %s | ✅ %d items")
-                    :format(os.date("%H:%M:%S"), #out))
-            end
+
+        -- hash-dedupe: build WITHOUT timestamp so identical payloads are caught
+        local coreTable = { items = out, userId = lp.UserId }
+        local coreJSON  = HttpService:JSONEncode(coreTable)
+        if coreJSON == lastInvCore then return end
+        lastInvCore = coreJSON
+
+        coreTable.game      = tostring(game.PlaceId)
+        coreTable.player    = lp.Name
+        coreTable.timestamp = os.time()
+
+        local ok = postJSON(WEB .. "/api/inventory", HttpService:JSONEncode(coreTable))
+        if ok then
+            print(("[SEND-INV] %s | ✅ %d items"):format(os.date("%H:%M:%S"), #out))
         end
     end
 
-    -- ─────────────────────────────────────────
-    -- ส่ง Character Info
-    -- ─────────────────────────────────────────
     local function sendChar()
         if count(cachedInfo) == 0 then return end
-        local payload = HttpService:JSONEncode({
-            game      = tostring(game.PlaceId),
-            player    = lp.Name,
-            userId    = lp.UserId,
-            timestamp = os.time(),
-            info      = cachedInfo,
-        })
-        local ok, res = pcall(req, {
-            Url = URL_CHAR, Method = "POST",
-            Headers = { ["Content-Type"] = "application/json" },
-            Body = payload,
-        })
-        if ok and res then
-            local code = res.StatusCode or res.Status or res.status or "?"
-            if tostring(code) == "200" then
-                print(("[SEND-CHAR] %s | ✅ %d fields")
-                    :format(os.date("%H:%M:%S"), count(cachedInfo)))
-            end
+
+        local coreTable = { info = cachedInfo, userId = lp.UserId }
+        local coreJSON  = HttpService:JSONEncode(coreTable)
+        if coreJSON == lastCharCore then return end
+        lastCharCore = coreJSON
+
+        coreTable.game      = tostring(game.PlaceId)
+        coreTable.player    = lp.Name
+        coreTable.timestamp = os.time()
+
+        local ok = postJSON(WEB .. "/api/character", HttpService:JSONEncode(coreTable))
+        if ok then
+            print(("[SEND-CHAR] %s | ✅ %d fields"):format(os.date("%H:%M:%S"), count(cachedInfo)))
         end
     end
 
-    -- ─────────────────────────────────────────
-    -- Main setup
-    -- ─────────────────────────────────────────
+    ------------------------------------------------------------------
+    -- Main loops
+    ------------------------------------------------------------------
+    cacheUILabels()
     refreshCharacterInfo()
     print(("✅ Character info: %d fields"):format(count(cachedInfo)))
-    for k, v in pairs(cachedInfo) do
-        if not tostring(k):find("^_") then
-            print(("   %s = %s"):format(tostring(k), tostring(v)))
-        end
-    end
 
     sendInv()
     sendChar()
 
-    -- ─────────────────────────────────────────
-    -- Loops
-    -- ─────────────────────────────────────────
     task.spawn(function()
         while task.wait(UI_POLL) do
-            if ah then refreshCache() end
+            if ah then refreshCache(ah) end
         end
     end)
 
@@ -446,7 +440,7 @@ task.spawn(function()
         end
     end)
 
-    -- Watchdog: กด M ใหม่ถ้า cache ว่าง
+    -- Watchdog: re-press M if the inventory cache goes empty
     task.spawn(function()
         local emptyRounds = 0
         while task.wait(2) do
@@ -456,8 +450,11 @@ task.spawn(function()
                     print("♻️ cache ว่าง — กด M ใหม่...")
                     pressM()
                     task.wait(0.6)
-                    refreshCache()
-                    if holder then hideUI(holder) end
+                    ah, holder = findHolder()
+                    if ah then
+                        refreshCache(ah)
+                        hideUI(holder)
+                    end
                     emptyRounds = 0
                 end
             else
