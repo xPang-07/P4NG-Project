@@ -139,8 +139,9 @@ end)
 
 -- ── heartbeat ──────────────────────────────────────────────────
 task.spawn(function()
+    task.wait(math.random() * 3)              -- กระจายจังหวะ ไม่ให้หลายบัญชียิงพร้อมกัน
     while not dropped do
         post("/")
-        task.wait(BEAT_INTERVAL)
+        task.wait(BEAT_INTERVAL + math.random())
     end
 end)
