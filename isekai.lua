@@ -1,174 +1,222 @@
 -- ============================================
--- Auto Farm Script (Re-runnable Version)
--- รองรับ: รันซ้ำได้ / Loop อัตโนมัติ / ไม่มี GUI ซ้ำ
+-- Auto Farm & Utility Script (Orion UI Edition)
+-- รองรับ: Orion Library / Multi-Tab / Speed / Noclip / Anti-AFK / Rejoin
 -- ============================================
 
--- ✅ 1) ลบ GUI เก่าทิ้งก่อน (ถ้ามี) เพื่อป้องกันการซ้ำ
+local OrionLib = loadstring(game:HttpGet('https://raw.githubusercontent.com/shlexware/Orion/main/source'))()
 local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TeleportService = game:GetService("TeleportService")
 local VirtualUser = game:GetService("VirtualUser")
-
+local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
-local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
--- ล้าง GUI เก่า + หยุด Loop เก่า (ถ้ามี)
-if getgenv().AutoFarmRunning then
-    getgenv().AutoFarmRunning = false
-    task.wait(0.2)
+-- ลบ GUI เก่าออกก่อนเมื่อรันซ้ำ (Clean Re-run)
+if getgenv().AutoFarmScriptLoaded then
+    OrionLib:Destroy()
+    task.wait(0.3)
+end
+getgenv().AutoFarmScriptLoaded = true
+
+-- ตัวแปร Global กำหนดสถานะ
+getgenv().AutoFarm = false
+getgenv().FarmDelay = 0.5
+getgenv().Noclip = false
+getgenv().InfJump = false
+getgenv().CustomSpeed = 16
+getgenv().EnableSpeed = false
+
+-- ============================================
+-- 1) ระบบป้องกัน AFK Kick (Anti-AFK)
+-- ============================================
+if not getgenv().AntiAFKConnected then
+    getgenv().AntiAFKConnected = true
+    LocalPlayer.Idled:Connect(function()
+        VirtualUser:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+        task.wait(1)
+        VirtualUser:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+    end)
 end
 
-local oldGui = PlayerGui:FindFirstChild("AutoFarmGUI")
-if oldGui then
-    oldGui:Destroy()
-end
+-- ============================================
+-- 2) สร้าง หน้าต่างหลัก (GUI Window)
+-- ============================================
+local Window = OrionLib:MakeWindow({
+    Name = "⚡ Auto Farm Hub",
+    HidePremium = false,
+    SaveConfig = false,
+    ConfigFolder = "AutoFarmHub",
+    IntroText = "Auto Farm Hub"
+})
 
--- เก็บสถานะไว้ใน getgenv() เพื่อให้เข้าถึงได้จากทุกที่
-getgenv().AutoFarmRunning = false
+-- --------------------------------------------
+-- TAB 1: Auto Farm (ระบบฟาร์ม)
+-- --------------------------------------------
+local FarmTab = Window:MakeTab({
+    Name = "Auto Farm",
+    Icon = "rbxassetid://4483345998",
+    PremiumOnly = false
+})
 
--- ✅ 2) ป้องกัน AFK Kick
-LocalPlayer.Idled:Connect(function()
-    VirtualUser:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
-    task.wait(1)
-    VirtualUser:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
-end)
+FarmTab:AddSection({ Name = "ตั้งค่าการฟาร์มอัตโนมัติ" })
+
+FarmTab:AddToggle({
+    Name = "เปิดใช้งาน Auto Farm",
+    Default = false,
+    Callback = function(Value)
+        getgenv().AutoFarm = Value
+        if Value then
+            task.spawn(function()
+                while getgenv().AutoFarm do
+                    local success, err = pcall(function()
+                        -- ====================================================
+                        -- 🔴 [ตำแหน่งใส่ LOGIC ฟาร์มของเกม]
+                        --
+                        -- ตัวอย่างที่ 1: ยิง RemoteEvent เพื่อตีมอน / เก็บของ
+                        -- local remote = game:GetService("ReplicatedStorage"):FindFirstChild("AttackRemote")
+                        -- if remote then remote:FireServer() end
+                        --
+                        -- ตัวอย่างที่ 2: วาร์ปตัวละครไปหาพิกัดเป้าหมาย
+                        -- if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+                        --     LocalPlayer.Character.HumanoidRootPart.CFrame = CFrame.new(0, 50, 0)
+                        -- end
+                        -- ====================================================
+
+                        print("[Auto Farm] Loop กำลังทำงาน...")
+                    end)
+
+                    if not success then
+                        warn("[Auto Farm Error]: " .. tostring(err))
+                    end
+
+                    task.wait(getgenv().FarmDelay)
+                end
+            end)
+        end
+    end
+})
+
+FarmTab:AddSlider({
+    Name = "หน่วงเวลา Loop (วินาที)",
+    Min = 0.1,
+    Max = 3.0,
+    Default = 0.5,
+    Color = Color3.fromRGB(0, 255, 150),
+    Increment = 0.1,
+    ValueName = "วิ",
+    Callback = function(Value)
+        getgenv().FarmDelay = Value
+    end
+})
+
+-- --------------------------------------------
+-- TAB 2: Player Mods (ปรับแต่งตัวละคร)
+-- --------------------------------------------
+local PlayerTab = Window:MakeTab({
+    Name = "ตัวละคร (Player)",
+    Icon = "rbxassetid://4483345998",
+    PremiumOnly = false
+})
+
+PlayerTab:AddSection({ Name = "ความเร็ว และการเคลื่อนที่" })
+
+PlayerTab:AddToggle({
+    Name = "เปิดใช้งานปรับความเร็ว (WalkSpeed)",
+    Default = false,
+    Callback = function(Value)
+        getgenv().EnableSpeed = Value
+    end
+})
+
+PlayerTab:AddSlider({
+    Name = "กำหนดความเร็ว",
+    Min = 16,
+    Max = 300,
+    Default = 16,
+    Color = Color3.fromRGB(255, 200, 0),
+    Increment = 1,
+    ValueName = "Speed",
+    Callback = function(Value)
+        getgenv().CustomSpeed = Value
+    end
+})
+
+PlayerTab:AddToggle({
+    Name = "เดินทะลุกำแพง (Noclip)",
+    Default = false,
+    Callback = function(Value)
+        getgenv().Noclip = Value
+    end
+})
+
+PlayerTab:AddToggle({
+    Name = "กระโดดได้ไม่จำกัด (Infinite Jump)",
+    Default = false,
+    Callback = function(Value)
+        getgenv().InfJump = Value
+    end
+})
+
+-- --------------------------------------------
+-- TAB 3: Utilities & Server (เครื่องมือเสริม)
+-- --------------------------------------------
+local UtilTab = Window:MakeTab({
+    Name = "เครื่องมือเสริม",
+    Icon = "rbxassetid://4483345998",
+    PremiumOnly = false
+})
+
+UtilTab:AddSection({ Name = "จัดการเซิร์ฟเวอร์ & GUI" })
+
+UtilTab:AddButton({
+    Name = "เข้าห้องเดิมใหม่ (Rejoin Server)",
+    Callback = function()
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+    end
+})
+
+UtilTab:AddButton({
+    Name = "ปิดสคริปต์และลบ GUI (Unload)",
+    Callback = function()
+        getgenv().AutoFarm = false
+        getgenv().Noclip = false
+        getgenv().InfJump = false
+        getgenv().EnableSpeed = false
+        getgenv().AutoFarmScriptLoaded = false
+        OrionLib:Destroy()
+    end
+})
 
 -- ============================================
--- 3) สร้าง GUI
+-- 3) Background Event Handlers (Speed / Noclip / InfJump)
 -- ============================================
-local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "AutoFarmGUI"
-ScreenGui.ResetOnSpawn = false
-ScreenGui.Parent = PlayerGui
-
-local MainFrame = Instance.new("Frame")
-MainFrame.Size = UDim2.new(0, 250, 0, 180)
-MainFrame.Position = UDim2.new(0.5, -125, 0.5, -90)
-MainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
-MainFrame.BorderSizePixel = 0
-MainFrame.Active = true
-MainFrame.Draggable = true
-MainFrame.Parent = ScreenGui
-Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 10)
-
-local Title = Instance.new("TextLabel")
-Title.Size = UDim2.new(1, 0, 0, 35)
-Title.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
-Title.Text = "⚡ Auto Farm (Loop)"
-Title.TextColor3 = Color3.fromRGB(0, 255, 150)
-Title.Font = Enum.Font.GothamBold
-Title.TextScaled = true
-Title.Parent = MainFrame
-Instance.new("UICorner", Title).CornerRadius = UDim.new(0, 10)
-
-local ToggleButton = Instance.new("TextButton")
-ToggleButton.Size = UDim2.new(0.9, 0, 0, 45)
-ToggleButton.Position = UDim2.new(0.05, 0, 0.28, 0)
-ToggleButton.BackgroundColor3 = Color3.fromRGB(0, 170, 0)
-ToggleButton.Text = "▶ เริ่ม Auto Farm"
-ToggleButton.TextColor3 = Color3.new(1, 1, 1)
-ToggleButton.Font = Enum.Font.GothamSemibold
-ToggleButton.TextScaled = true
-ToggleButton.Parent = MainFrame
-Instance.new("UICorner", ToggleButton).CornerRadius = UDim.new(0, 8)
-
--- ปุ่มตั้งค่าความเร็ว Loop
-local SpeedLabel = Instance.new("TextLabel")
-SpeedLabel.Size = UDim2.new(0.9, 0, 0, 20)
-SpeedLabel.Position = UDim2.new(0.05, 0, 0.55, 0)
-SpeedLabel.BackgroundTransparency = 1
-SpeedLabel.Text = "หน่วงเวลา Loop: 0.5 วินาที"
-SpeedLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-SpeedLabel.Font = Enum.Font.Gotham
-SpeedLabel.TextScaled = true
-SpeedLabel.Parent = MainFrame
-
-local SpeedBox = Instance.new("TextBox")
-SpeedBox.Size = UDim2.new(0.5, 0, 0, 25)
-SpeedBox.Position = UDim2.new(0.25, 0, 0.7, 0)
-SpeedBox.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-SpeedBox.Text = "0.5"
-SpeedBox.TextColor3 = Color3.new(1, 1, 1)
-SpeedBox.Font = Enum.Font.Gotham
-SpeedBox.TextScaled = true
-SpeedBox.Parent = MainFrame
-Instance.new("UICorner", SpeedBox).CornerRadius = UDim.new(0, 6)
-
-local StatusLabel = Instance.new("TextLabel")
-StatusLabel.Size = UDim2.new(0.9, 0, 0, 20)
-StatusLabel.Position = UDim2.new(0.05, 0, 0.88, 0)
-StatusLabel.BackgroundTransparency = 1
-StatusLabel.Text = "สถานะ: พร้อมทำงาน"
-StatusLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-StatusLabel.Font = Enum.Font.Gotham
-StatusLabel.TextScaled = true
-StatusLabel.Parent = MainFrame
-
--- ============================================
--- 4) ฟังก์ชัน Auto Farm (Loop หลัก)
--- ============================================
-local function runFarmLoop()
-    local loopId = tick() -- ✅ ใช้ ID ระบุรอบ เพื่อป้องกัน loop ผีจากรอบเก่า
-
-    while getgenv().AutoFarmRunning and getgenv().AutoFarmLoopId == loopId do
-        -- อ่านค่าหน่วงเวลาจากช่องกรอก
-        local delay = tonumber(SpeedBox.Text) or 0.5
-        if delay < 0.1 then delay = 0.1 end
-
-        -- ----------------------------------------------------
-        -- [จุดแก้ไข] ใส่ logic ฟาร์มของคุณตรงนี้
-        -- ตัวอย่าง:
-        -- local remote = ReplicatedStorage:FindFirstChild("CollectReward")
-        -- if remote then remote:FireServer() end
-        -- ----------------------------------------------------
-        local success, err = pcall(function()
-            print("[Auto Farm] Loop ทำงาน (ID: " .. tostring(loopId) .. ")")
-        end)
-
-        if not success then
-            warn("[Auto Farm] Error: " .. tostring(err))
+RunService.Stepped:Connect(function()
+    if LocalPlayer.Character then
+        -- จัดการ WalkSpeed
+        local humanoid = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if humanoid and getgenv().EnableSpeed then
+            humanoid.WalkSpeed = getgenv().CustomSpeed
         end
 
-        StatusLabel.Text = "สถานะ: กำลังฟาร์ม..."
-        StatusLabel.TextColor3 = Color3.fromRGB(0, 255, 100)
-
-        task.wait(delay) -- ✅ ใช้ task.wait() เพื่อให้ Executor ยังตอบสนองได้
-    end
-
-    print("[Auto Farm] Loop (ID: " .. tostring(loopId) .. ") หยุดแล้ว")
-end
-
--- ============================================
--- 5) ปุ่มเปิด/ปิด พร้อมระบบ Re-run
--- ============================================
-ToggleButton.MouseButton1Click:Connect(function()
-    if not getgenv().AutoFarmRunning then
-        -- ✅ เริ่ม Loop ใหม่ (สร้าง ID ใหม่ทุกครั้ง)
-        getgenv().AutoFarmRunning = true
-        getgenv().AutoFarmLoopId = tick()
-
-        ToggleButton.Text = "⏹ หยุด Auto Farm"
-        ToggleButton.BackgroundColor3 = Color3.fromRGB(200, 0, 0)
-        task.spawn(runFarmLoop)
-    else
-        -- ✅ หยุด Loop (loop จะออกจาก while เองเมื่อเจอเงื่อนไข false)
-        getgenv().AutoFarmRunning = false
-
-        ToggleButton.Text = "▶ เริ่ม Auto Farm"
-        ToggleButton.BackgroundColor3 = Color3.fromRGB(0, 170, 0)
-        StatusLabel.Text = "สถานะ: หยุดทำงาน"
-        StatusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+        -- จัดการ Noclip
+        if getgenv().Noclip then
+            for _, part in pairs(LocalPlayer.Character:GetDescendants()) do
+                if part:IsA("BasePart") and part.CanCollide then
+                    part.CanCollide = false
+                end
+            end
+        end
     end
 end)
 
--- อัปเดตข้อความ label เมื่อแก้ตัวเลข
-SpeedBox.FocusLost:Connect(function()
-    local v = tonumber(SpeedBox.Text)
-    if v and v >= 0.1 then
-        SpeedLabel.Text = "หน่วงเวลา Loop: " .. v .. " วินาที"
-    else
-        SpeedBox.Text = "0.5"
-        SpeedLabel.Text = "หน่วงเวลา Loop: 0.5 วินาที"
+-- จัดการ Infinite Jump
+UserInputService.JumpRequest:Connect(function()
+    if getgenv().InfJump and LocalPlayer.Character then
+        local humanoid = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if humanoid then
+            humanoid:ChangeState("Jumping")
+        end
     end
 end)
 
-print("[Auto Farm] โหลดสคริปต์สำเร็จ! กดปุ่มเพื่อเริ่ม/หยุดได้เลย")
+OrionLib:Init()
