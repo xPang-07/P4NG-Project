@@ -10,6 +10,7 @@
   ตัวเลือก (ตั้งก่อนรันไฟล์นี้ ผ่าน getgenv())
     P4NG_LOWGFX = false   ปิดโหมดลดภาระเครื่อง (ค่าเริ่มต้นเปิด: กราฟิกต่ำสุด + ปิดเสียง)
     P4NG_FPS    = 15      จำกัด FPS (ต้องมี setfpscap) — ไม่ตั้ง = ไม่ยุ่ง
+    P4NG_TOKEN  = "…"     วาง token ที่คัดลอกจาก ตั้งค่า → เชื่อมต่อ api.lua
 
   ต้องการ executor ที่มี: request / http_request / syn.request  และ loadstring
   คุยกับ 127.0.0.1 เท่านั้น (พอร์ต 3030–3032 ตาม core/heartbeat.py) — ไม่ส่งข้อมูลออกเน็ต
@@ -17,7 +18,6 @@
 ]]
 
 if getgenv and getgenv().__P4NG_API then return end
-if getgenv then getgenv().__P4NG_API = true end
 
 local PORTS         = { 3030, 3031, 3032 }
 local BEAT_INTERVAL = 15      -- วิ (launcher ถือว่าเงียบถ้าเกิน ~30 วิ)
@@ -25,6 +25,12 @@ local HTTP_TIMEOUT  = 5
 local BEAT_RETRIES  = 3       -- ลองซ้ำต่อรอบ heartbeat
 local BEAT_RETRY_WAIT = 0.5
 local POLL_INTERVAL = 3       -- เช็ก GetErrorCode สำรอง (วิ)
+local TOKEN = getgenv and getgenv().P4NG_TOKEN
+if type(TOKEN) ~= "string" or #TOKEN < 32 then
+    warn('[P4NG] ตั้ง getgenv().P4NG_TOKEN ใน api.lua ก่อนใช้งาน')
+    return
+end
+if getgenv then getgenv().__P4NG_API = true end
 
 -- error code ที่ไม่ใช่การหลุดจริง (กัน false positive)
 local IGNORED_CODES = {
@@ -61,7 +67,7 @@ local function call(method, path, body)
     local ok, res = pcall(http, {
         Url = base .. path,
         Method = method,
-        Headers = { ["Content-Type"] = "application/json" },
+        Headers = { ["Content-Type"] = "application/json", ["Authorization"] = "Bearer " .. TOKEN },
         Body = body and HttpService:JSONEncode(body) or nil,
         Timeout = HTTP_TIMEOUT,
     })
